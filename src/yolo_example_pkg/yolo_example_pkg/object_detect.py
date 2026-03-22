@@ -33,12 +33,12 @@ class YoloDetectionNode(Node):
 
         # 訂閱影像 Topic
         self.image_sub = self.create_subscription(
-            CompressedImage, "/camera/image/compressed", self.image_callback, 10
+            CompressedImage, "/camera/image/compressed", self.image_callback, 1
         )
 
         # 訂閱 **無壓縮** 深度圖 Topic
         self.depth_sub_raw = self.create_subscription(
-            Image, "/camera/depth/image_raw", self.depth_callback_raw, 10
+            Image, "/camera/depth/image_raw", self.depth_callback_raw, 1
         )
 
         # 訂閱 **壓縮** 深度圖 Topic
@@ -46,7 +46,7 @@ class YoloDetectionNode(Node):
             CompressedImage,
             "/camera/depth/compressed",
             self.depth_callback_compressed,
-            10,
+            1,
         )
 
         # 發佈處理後的影像 Topic
@@ -155,12 +155,17 @@ class YoloDetectionNode(Node):
         return image, points
 
     def draw_bounding_boxes(self, image, results):
-        """在影像上繪製 YOLO 檢測到的 Bounding Box"""
-        # 一開始預設沒找到目標
+        """在影像上繪製 YOLO 檢測到的 Bounding Box，並挑選最近的目標"""
         found_target = 0
-        target_distance = 0.0
-        delta_x = 0.0
+        best_distance = float('inf')  # 尋找最小值用的初始無限大
+        best_delta_x = 0.0
+
         image, points = self.draw_cross(image)
+        
+        # 取得畫面的精確正中心 X 座標
+        height, width = image.shape[:2]
+        cx_center = width // 2
+
         for result in results:
             for box in result.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -168,38 +173,32 @@ class YoloDetectionNode(Node):
                 class_id = int(box.cls[0])
                 class_name = self.model.names[class_id]
 
-                # 只保留設定內的標籤
+                # 只保留設定內的標籤 (例如 tennis)
                 if self.allowed_labels and class_name not in self.allowed_labels:
                     continue
 
                 # 計算 Bounding Box 正中心點
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-                # 如果符合標籤，表示找到目標
-                found_target = 1
-
                 # 優先使用無壓縮的深度圖
                 depth_value = self.get_depth_at(cx, cy)
-                target_distance = depth_value
-                depth_text = f"{depth_value:.2f}m" if depth_value else "N/A"
+                depth_text = f"{depth_value:.2f}m" if depth_value > 0 else "N/A"
 
-                # ------ 計算與影像中心的偏移量 ------
-                delta_x = cx - points[4][0]
-
-                # 繪製框和標籤
+                # 繪製框和標籤 (所有看到的網球都畫框)
                 cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 label = f"{class_name} {conf:.2f} Depth: {depth_text}"
+                cv2.putText(image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-                cv2.putText(
-                    image,
-                    label,
-                    (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 0),
-                    2,
-                )
-        self.publish_target_info(found_target, target_distance, delta_x)
+                # 🌟 目標過濾邏輯：只記錄「有效深度」且「距離最近」的那顆球
+                if depth_value > 0.1 and depth_value < best_distance:
+                    best_distance = depth_value
+                    best_delta_x = float(cx - cx_center) # 修正偏移量算法
+                    found_target = 1
+        
+        # 迴圈結束後，只發布那顆「最完美」的目標資訊
+        final_distance = best_distance if found_target == 1 else 0.0
+        self.publish_target_info(found_target, final_distance, best_delta_x)
+        
         return image
 
     def get_depth_at(self, x, y):
